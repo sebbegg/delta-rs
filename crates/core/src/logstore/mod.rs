@@ -513,22 +513,10 @@ pub(crate) fn get_engine(store: Arc<dyn ObjectStore>) -> Arc<dyn Engine> {
 
 #[cfg(feature = "datafusion")]
 fn object_store_url(location: &Url) -> ObjectStoreUrl {
-    use object_store::path::DELIMITER;
+    use arrow_cast::base64::{Engine, BASE64_URL_SAFE_NO_PAD};
 
-    // azure storage urls encode the container as user in the url
-    let user_at = match location.username() {
-        u if !u.is_empty() => format!("{u}@"),
-        _ => "".to_string(),
-    };
-
-    ObjectStoreUrl::parse(format!(
-        "delta-rs://{}{}-{}{}",
-        user_at,
-        location.scheme(),
-        location.host_str().unwrap_or("-"),
-        location.path().replace(DELIMITER, "-").replace(':', "-")
-    ))
-    .expect("Invalid object store url.")
+    let b64_url = BASE64_URL_SAFE_NO_PAD.encode(location.to_string());
+    ObjectStoreUrl::parse(format!("delta-rs://b64{b64_url}")).expect("Invalid object store url.")
 }
 
 /// Parse the path from a URL accounting for special case witjh S3
