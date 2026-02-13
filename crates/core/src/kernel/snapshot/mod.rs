@@ -34,18 +34,18 @@ use delta_kernel::{
     Engine, EvaluationHandler, Expression, ExpressionEvaluator, PredicateRef, Version,
 };
 use futures::future::ready;
-use futures::stream::{once, BoxStream};
+use futures::stream::{BoxStream, once};
 use futures::{StreamExt, TryStreamExt};
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use serde_json::Deserializer;
 use url::Url;
 
 use super::{Action, CommitInfo, Metadata, Protocol};
-use crate::kernel::arrow::engine_ext::{kernel_to_arrow, ExpressionEvaluatorExt};
-use crate::kernel::{spawn_blocking_with_span, StructType, ARROW_HANDLER};
+use crate::kernel::arrow::engine_ext::{ExpressionEvaluatorExt, rb_from_scan_meta};
+use crate::kernel::{ARROW_HANDLER, StructType, spawn_blocking_with_span};
 use crate::logstore::{LogStore, LogStoreExt};
-use crate::{to_kernel_predicate, DeltaResult, DeltaTableConfig, DeltaTableError, PartitionFilter};
+use crate::{DeltaResult, DeltaTableConfig, DeltaTableError, PartitionFilter, to_kernel_predicate};
 
 pub use self::log_data::*;
 pub use iterators::*;
@@ -199,12 +199,12 @@ impl Snapshot {
 
     /// Get the table metadata of the snapshot
     pub fn metadata(&self) -> &Metadata {
-        self.inner.metadata()
+        self.inner.table_configuration().metadata()
     }
 
     /// Get the table protocol of the snapshot
     pub fn protocol(&self) -> &Protocol {
-        self.inner.protocol()
+        self.inner.table_configuration().protocol()
     }
 
     /// Get the table config which is loaded with of the snapshot
@@ -257,7 +257,7 @@ impl Snapshot {
         let engine = log_store.engine(None);
         let stream = scan
             .scan_metadata(engine)
-            .map(|d| Ok(kernel_to_arrow(d?)?.scan_files));
+            .map(|d| Ok(rb_from_scan_meta(d?)?));
 
         ScanRowOutStream::new(self.inner.clone(), stream).boxed()
     }
@@ -278,9 +278,37 @@ impl Snapshot {
         let engine = log_store.engine(None);
         let stream = scan
             .scan_metadata_from(engine, existing_version, existing_data, existing_predicate)
-            .map(|d| Ok(kernel_to_arrow(d?)?.scan_files));
+            .map(|d| Ok(rb_from_scan_meta(d?)?));
 
         ScanRowOutStream::new(self.inner.clone(), stream).boxed()
+    }
+
+    /// Stream the active files in the snapshot
+    ///
+    /// This function returns a stream of [`LogicalFileView`] objects,
+    /// which represent the active files in the snapshot.
+    ///
+    /// ## Parameters
+    ///
+    /// * `log_store` - A reference to a [`LogStore`] implementation.
+    /// * `predicate` - An optional predicate to filter the files.
+    ///
+    /// ## Returns
+    ///
+    /// A stream of [`LogicalFileView`] objects.
+    pub fn file_views(
+        &self,
+        log_store: &dyn LogStore,
+        predicate: Option<PredicateRef>,
+    ) -> BoxStream<'_, DeltaResult<LogicalFileView>> {
+        self.files(log_store, predicate)
+            .map_ok(|batch| {
+                futures::stream::iter(0..batch.num_rows()).map(move |idx| {
+                    Ok::<_, DeltaTableError>(LogicalFileView::new(batch.clone(), idx))
+                })
+            })
+            .try_flatten()
+            .boxed()
     }
 
     /// Get the commit infos in the snapshot
@@ -322,10 +350,10 @@ impl Snapshot {
         {
             // safety: object store path are always valid urls paths.
             let dummy_path = dummy_url.join(meta.location.as_ref()).unwrap();
-            if let Some(parsed_path) = ParsedLogPath::try_from(dummy_path)? {
-                if matches!(parsed_path.file_type, LogPathFileType::Commit) {
-                    commit_files.push(meta);
-                }
+            if let Some(parsed_path) = ParsedLogPath::try_from(dummy_path)?
+                && matches!(parsed_path.file_type, LogPathFileType::Commit)
+            {
+                commit_files.push(meta);
             }
         }
         commit_files.sort_unstable_by(|a, b| b.location.cmp(&a.location));
@@ -369,11 +397,13 @@ impl Snapshot {
                     .map(|field| Expression::column(["remove", field.name()])),
             )
             .into();
-            ARROW_HANDLER.new_expression_evaluator(
-                TOMBSTONE_SCHEMA.clone(),
-                expression,
-                Remove::to_data_type(),
-            )
+            ARROW_HANDLER
+                .new_expression_evaluator(
+                    TOMBSTONE_SCHEMA.clone(),
+                    expression,
+                    Remove::to_data_type(),
+                )
+                .expect("Failed to create tombstone evaluator")
         });
 
         // TODO: which capacity to choose
@@ -385,7 +415,6 @@ impl Snapshot {
 
         let remove_data = match self.inner.log_segment().read_actions(
             engine.as_ref(),
-            TOMBSTONE_SCHEMA.clone(),
             TOMBSTONE_SCHEMA.clone(),
             None,
         ) {
@@ -471,8 +500,16 @@ pub(crate) async fn resolve_snapshot(
     log_store: &dyn LogStore,
     maybe_snapshot: Option<EagerSnapshot>,
     require_files: bool,
+    version: Option<Version>,
 ) -> DeltaResult<EagerSnapshot> {
     if let Some(snapshot) = maybe_snapshot {
+        if let Some(version) = version
+            && snapshot.version() as Version != version
+        {
+            return Err(DeltaTableError::Generic(
+                "Provided snapshot version does not match the requested version".to_string(),
+            ));
+        }
         if require_files {
             snapshot.with_files(log_store).await
         } else {
@@ -481,7 +518,7 @@ pub(crate) async fn resolve_snapshot(
     } else {
         let mut config = DeltaTableConfig::default();
         config.require_files = require_files;
-        EagerSnapshot::try_new(log_store, config, None).await
+        EagerSnapshot::try_new(log_store, config, version.map(|v| v as i64)).await
     }
 }
 
@@ -628,27 +665,7 @@ impl EagerSnapshot {
         log_store: &dyn LogStore,
         predicate: Option<PredicateRef>,
     ) -> BoxStream<'_, DeltaResult<LogicalFileView>> {
-        if !self.snapshot.load_config().require_files {
-            return Box::pin(once(ready(Err(DeltaTableError::NotInitializedWithFiles(
-                "file_views".into(),
-            )))));
-        }
-
-        self.snapshot
-            .files_from(
-                log_store,
-                predicate,
-                self.version() as u64,
-                Box::new(self.files.clone().into_iter()),
-                None,
-            )
-            .map_ok(|batch| {
-                futures::stream::iter(0..batch.num_rows()).map(move |idx| {
-                    Ok::<_, DeltaTableError>(LogicalFileView::new(batch.clone(), idx))
-                })
-            })
-            .try_flatten()
-            .boxed()
+        self.snapshot.file_views(log_store, predicate)
     }
 
     #[deprecated(since = "0.29.0", note = "Use `files` with kernel predicate instead.")]
@@ -718,7 +735,7 @@ mod tests {
     use super::*;
     use crate::{
         kernel::transaction::CommitData,
-        test_utils::{assert_batches_sorted_eq, TestResult, TestTables},
+        test_utils::{TestResult, TestTables, assert_batches_sorted_eq},
     };
 
     impl Snapshot {
@@ -823,15 +840,15 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
         let expected = [
-            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------+",
-            "| path                                                                | size | modificationTime | stats_parsed                                          | deletionVector | fileConstantValues    |",
-            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------+",
-            "| part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet | 262  | 1587968626000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}} |",
-            "| part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet | 262  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}} |",
-            "| part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}} |",
-            "| part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}} |",
-            "| part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}} |",
-            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------+",
+            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------------------------------------------------------+",
+            "| path                                                                | size | modificationTime | stats_parsed                                          | deletionVector | fileConstantValues                                                    |",
+            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------------------------------------------------------+",
+            "| part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet | 262  | 1587968626000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet | 262  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "| part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet | 429  | 1587968602000    | {numRecords: , nullCount: , minValues: , maxValues: } |                | {partitionValues: {}, baseRowId: , defaultRowCommitVersion: , tags: } |",
+            "+---------------------------------------------------------------------+------+------------------+-------------------------------------------------------+----------------+-----------------------------------------------------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &batches);
 

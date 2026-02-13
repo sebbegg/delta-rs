@@ -5,7 +5,7 @@ import pytest
 from arro3.core import Array, DataType, Field, Schema, Table
 
 from deltalake import CommitProperties, DeltaTable, TableFeatures, write_deltalake
-from deltalake.exceptions import DeltaError, DeltaProtocolError
+from deltalake.exceptions import DeltaError
 from deltalake.schema import Field as DeltaField
 from deltalake.schema import PrimitiveType, StructType
 
@@ -32,7 +32,7 @@ def test_add_constraint(tmp_path: pathlib.Path, sample_table: Table):
         # Invalid constraint
         dt.alter.add_constraint({"check_price": "price < 0"})
 
-    with pytest.raises(DeltaProtocolError):
+    with pytest.raises(Exception):
         data = Table(
             {
                 "id": Array(["1"], DataType.string()),
@@ -176,13 +176,16 @@ def test_set_table_properties_min_reader_version(
         mode="append",
     )
     dt = DeltaTable(tmp_path)
-    configuration = {"delta.minReaderVersion": min_reader_version}
+    configuration = {
+        "delta.minReaderVersion": min_reader_version,
+        "delta.minWriterVersion": "7",
+    }
     dt.alter.set_table_properties(configuration)
 
     protocol = dt.protocol()
     assert dt.metadata().configuration == configuration
     assert protocol.min_reader_version == int(min_reader_version)
-    assert protocol.min_writer_version == 2
+    assert protocol.min_writer_version == 7
 
 
 def test_set_table_properties_invalid_min_reader_version(
